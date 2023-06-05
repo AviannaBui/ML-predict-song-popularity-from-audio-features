@@ -1,0 +1,479 @@
+---
+title: "Association between Audio Features, Popularity, and Listeners’ Preferences"
+author: "Avianna Bui"
+output: github_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+# Part 1. Data Preprocessing
+
+## Load Packages
+
+```{r, message=F, warning = FALSE}
+library(dplyr)
+library(readr)
+library(ggplot2)
+library(rpart.plot) 
+library(tidymodels)
+library(lubridate)
+library(cluster)
+library(purrr)
+library(ISLR2)
+library(plotmo)
+library(viridis) 
+library(vip)
+library(corrplot)
+library(ggcorrplot)
+library(devtools)
+library(factoextra)
+library(pander)
+library(ggpubr)
+tidymodels_prefer()
+```
+
+## Load Data
+
+```{r, message = F}
+billboard <- readr::read_csv('https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2021/2021-09-14/billboard.csv')
+
+audio_features <- readr::read_csv('https://raw.githubusercontent.com/rfordatascience/tidytuesday/master/data/2021/2021-09-14/audio_features.csv')
+```
+
+## Data Cleaning
+
+```{r, message = F, warning = F}
+songs <- billboard %>%
+  left_join(audio_features) %>%
+  mutate(year = year(as.Date(week_id, "%m/%d/%Y"))) %>%
+  select(year, song, performer, spotify_track_duration_ms, danceability, energy, key, loudness, mode, speechiness, acousticness, instrumentalness, liveness, valence, tempo, time_signature, spotify_track_popularity) %>%
+  drop_na() %>%
+  distinct(year, song, performer, .keep_all = TRUE) %>%
+  mutate(across(where(is.character), as.factor)) %>%
+  arrange(year)
+```
+
+# Part 2. Supervised Learning: Predict Spotify Track Popularity from Audio Features
+
+## Data Cleaning
+
+```{r}
+songs_sl <- songs %>%
+  select(-c(performer, year))
+```
+
+## Correlation Matrix 
+
+```{r}
+ggcorrplot(cor(songs_sl %>% select(-c(song, spotify_track_popularity))),
+           lab = TRUE,
+           ggtheme = ggplot2::theme_bw,
+           colors = c("#ffff9f", "#48aaad", "#0a1172"),
+           lab_size = 2, 
+           legend.title = "Correlation") +
+  theme(axis.text.x=element_text(size=8),
+        axis.text.y = element_text(size = 8),
+        legend.text = element_text(size = 8),
+        legend.title = element_text(size = 10),
+        plot.background = element_rect(fill = "black", color = "black"), panel.background = element_rect(color = "black", fill = "black"), text = element_text(color = "white"), axis.text=element_text(color="white"), axis.line =element_line(color = "white"), legend.background = element_rect(fill = "black", color = "black"))
+```
+
+## LASSO Modeling
+
+```{r}
+set.seed(202)
+
+songs_cv <- vfold_cv(songs_sl, v = 10) 
+
+data_rec <- recipe(spotify_track_popularity ~ ., data = songs_sl) %>%
+    update_role(song, new_role = "ID") %>%
+    step_nzv(all_predictors()) %>%
+    step_normalize(all_numeric_predictors()) 
+
+lm_lasso_spec_tune <- 
+    linear_reg() %>%
+    set_args(mixture = 1, penalty = tune()) %>% 
+    set_engine(engine = "glmnet") %>% 
+    set_mode("regression") 
+
+lasso_wf_tune <- workflow() %>% 
+    add_recipe(data_rec) %>% 
+    add_model(lm_lasso_spec_tune) 
+
+penalty_grid <- grid_regular(
+    penalty(range = c(-1, 3)), 
+    levels = 40)
+
+tune_output <- tune_grid( 
+    lasso_wf_tune,
+    resamples = songs_cv,
+    metrics = metric_set(mae),
+    grid = penalty_grid)
+
+tune_output %>% collect_metrics(summarize = TRUE)
+```
+
+```{r}
+# select the "best" value of lambda
+best_se_penalty <- select_by_one_std_err(tune_output, metric = "mae", desc(penalty)) 
+best_se_penalty
+```
+
+```{r}
+# select the best model
+final_wf_se <- finalize_workflow(lasso_wf_tune, best_se_penalty)
+
+final_fit_se <- fit(final_wf_se, data = songs_sl)
+
+tidy(final_fit_se)
+```
+
+```{r}
+# visualize coefficient path graph
+glmnet_output <- final_fit_se %>% extract_fit_parsnip() %>% pluck("fit")
+
+plot_glmnet(glmnet_output, label = TRUE, col = viridis(13)) 
+```
+
+```{r}
+# arrange variables based on their LASSO importance
+bool_predictor_exclude <- glmnet_output$beta==0
+
+var_imp <- sapply(seq_len(nrow(bool_predictor_exclude)), function(row) {
+    this_coeff_path <- bool_predictor_exclude[row,]
+    if(sum(this_coeff_path) == ncol(bool_predictor_exclude)){ return(0)}else{
+    return(ncol(bool_predictor_exclude) - which.min(this_coeff_path) + 1)}
+})
+
+var_imp_data <- tibble(
+    var_name = rownames(bool_predictor_exclude),
+    var_imp = var_imp
+)
+var_imp_data %>% arrange(desc(var_imp))
+```
+
+## Generalized Additive Model (GAM)
+
+```{r, message = F}
+# residual plot: model selection
+
+lasso_mod_out <- final_fit_se %>%
+    predict(new_data = songs_sl) %>%
+    bind_cols(songs_sl) %>%
+    mutate(resid = spotify_track_popularity - .pred)
+
+residplot1 <- lasso_mod_out %>% 
+    ggplot(aes(x = .pred, y = resid)) + 
+    geom_point(alpha = 0.2, color = "#f1abb9") +
+    geom_smooth(color = "#7e6551", se = FALSE) + 
+    geom_hline(yintercept = 0, color = "#f4f1de") + 
+    theme_classic() +
+    theme(plot.background = element_rect(fill = "black", color = "black"), panel.background = element_rect(color = "black", fill = "black"), text = element_text(color = "white"), axis.text=element_text(color="white"), axis.line =element_line(color = "white"))
+
+residplot2 <- lasso_mod_out %>% 
+    ggplot(aes(x = loudness, y = resid)) + 
+    geom_point(alpha = 0.2, color = "#f1abb9") +
+    geom_smooth(color = "#7e6551", se = FALSE) + 
+    geom_hline(yintercept = 0, color = "#f4f1de") + 
+    theme_classic() +
+    theme(plot.background = element_rect(fill = "black", color = "black"), panel.background = element_rect(color = "black", fill = "black"), text = element_text(color = "white"), axis.text=element_text(color="white"), axis.line =element_line(color = "white"))
+
+# png(filename="residplots.png", width=1600, height=600)
+ggarrange(residplot1, residplot2)
+```
+
+```{r, message = F, warning = F}
+gam_spec <- 
+    gen_additive_mod() %>%
+    set_args(select_features = TRUE, adjust_deg_free = tune()) %>%
+    set_engine(engine = "mgcv") %>%
+    set_mode("regression")
+
+gam_wf <- workflow() %>% 
+    add_variables(outcomes = spotify_track_popularity, predictors = c(spotify_track_duration_ms, danceability, energy, loudness, mode, speechiness, acousticness, instrumentalness, liveness, valence, tempo, time_signature)) %>% 
+    add_model(gam_spec, formula = spotify_track_popularity ~ mode + s(spotify_track_duration_ms, k=2) + s(danceability, k=2) + s(energy, k=2) + s(loudness, k=2) + s(speechiness, k=2) + s(acousticness, k=2) + s(instrumentalness, k=2) + s(liveness, k=2) + s(valence, k=2) + s(tempo, k=2) + s(time_signature, k=2))
+
+tuning_param_grid <- grid_regular(
+    adjust_deg_free(range = c(0.25, 4)),
+    levels = 8
+)
+
+tune_output <- tune_grid( 
+    gam_wf,
+    resamples = songs_cv,
+    metrics = metric_set(mae),
+    grid = tuning_param_grid
+)
+```
+
+```{r, warning=F}
+tune_output %>% collect_metrics()
+tune_output %>% show_best()
+
+autoplot(tune_output) + theme_classic()
+
+best_by_1se_param <- tune_output %>% 
+    select_by_one_std_err(metric = "mae", desc(adjust_deg_free))
+
+best_by_1se_param 
+
+gam_mod_best1se <- finalize_workflow(gam_wf, best_by_1se_param) %>%
+    fit(data = songs_sl)
+```
+
+## Random Forest
+
+```{r}
+set.seed(202)
+rand_forest <- songs_sl %>%
+  select(-c(song))
+  
+rf_spec <- rand_forest() %>%
+    set_engine(engine = "ranger") %>% 
+    set_args(
+        mtry = NULL, 
+        trees = 500, 
+        min_n = 2,
+        importance = "impurity"
+    ) %>%
+    set_mode("regression") 
+
+data_rec <- recipe(spotify_track_popularity ~ ., data = rand_forest)
+
+data_wf <- workflow() %>%
+    add_model(rf_spec) %>%
+    add_recipe(data_rec)
+
+rf_fit <- fit(data_wf, data = rand_forest)
+
+
+rf_fit
+```
+
+```{r}
+# variable importance
+rf_fit %>% 
+    extract_fit_engine() %>% 
+    vip(num_features = 13, aesthetics = list(color = "pink", fill = "pink")) + 
+    theme_classic() +
+    theme(plot.background = element_rect(fill = "black", color = "black"), panel.background = element_rect(color = "black", fill = "black"), text = element_text(color = "white"), axis.text=element_text(color="white"), axis.line =element_line(color = "white"))
+```
+
+## Evaluate Model Performance and Variable Importance
+
+```{r}
+songs %>%
+  mutate(year = factor(year)) %>%
+  ggplot(aes(x = year, y = spotify_track_popularity)) +
+  geom_boxplot(fill = "#ffcfe3", color = "#ff9bc5") +
+  geom_hline(yintercept = mean(songs$spotify_track_popularity), color = "white", linetype = "dotdash") +
+  theme_classic() +
+  theme(plot.background = element_rect(fill = "black", color = "black"), panel.background = element_rect(color = "black", fill = "black"), legend.background = element_rect(color = "black", fill = "black"), text = element_text(color = "white"), axis.text=element_text(color="white"), axis.line =element_line(color = "white"), axis.text.x =  element_text(angle = 90, size = 8))
+```
+
+```{r, message = F}
+scat1 <- songs_sl %>% 
+    ggplot(aes(x = loudness, y = spotify_track_popularity)) + 
+    geom_point(alpha = 0.2, color = "#f1abb9") +
+    geom_smooth(color = "white", se = FALSE) + 
+    theme_classic() +
+    theme(plot.background = element_rect(fill = "black", color = "black"), panel.background = element_rect(color = "black", fill = "black"), text = element_text(color = "white"), axis.text=element_text(color="white"), axis.line =element_line(color = "white"))
+
+scat2 <- songs_sl %>% 
+    ggplot(aes(x = valence, y = spotify_track_popularity)) + 
+    geom_point(alpha = 0.2, color = "#f1abb9") +
+    geom_smooth(color = "white", se = FALSE) + 
+    theme_classic() +
+    theme(plot.background = element_rect(fill = "black", color = "black"), panel.background = element_rect(color = "black", fill = "black"), text = element_text(color = "white"), axis.text=element_text(color="white"), axis.line =element_line(color = "white"))
+
+scat3 <- songs_sl %>% 
+    ggplot(aes(x = acousticness, y = spotify_track_popularity)) + 
+    geom_point(alpha = 0.2, color = "#f1abb9") +
+    geom_smooth(color = "white", se = FALSE) + 
+    theme_classic() +
+    theme(plot.background = element_rect(fill = "black", color = "black"), panel.background = element_rect(color = "black", fill = "black"), text = element_text(color = "white"), axis.text=element_text(color="white"), axis.line =element_line(color = "white"))
+
+scat4 <- songs_sl %>% 
+    ggplot(aes(x = speechiness, y = spotify_track_popularity)) + 
+    geom_point(alpha = 0.2, color = "#f1abb9") +
+    geom_smooth(color = "white", se = FALSE) + 
+    theme_classic() +
+    theme(plot.background = element_rect(fill = "black", color = "black"), panel.background = element_rect(color = "black", fill = "black"), text = element_text(color = "white"), axis.text=element_text(color="white"), axis.line =element_line(color = "white"))
+
+# png(filename="scatterplots.png", width=1600, height=1000)
+ggarrange(scat1, scat2, scat3, scat4, ncol = 2, nrow = 2)
+```
+
+# Part 3. Unsupervised Learning: Identify Song Clusters across Decades among Important Audio Features
+
+## Data Cleaning
+
+```{r}
+songs_2000s <- songs %>%
+  filter(year >= 2000 & year <= 2009) %>%
+  select(valence, acousticness, loudness)
+
+songs_2010s <- songs %>%
+  filter(year >= 2010 & year <= 2019) %>%
+  select(valence, acousticness, loudness)
+```
+
+## Picking $k$
+```{r}
+tot_wc_ss_2000 <- rep(0, 15)
+
+for (k in 1:15) {
+    kclust_2000 <- kmeans(scale(songs_2000s), centers = k)
+
+    tot_wc_ss_2000[k] <- kclust_2000$tot.withinss
+}
+
+tot_wc_ss_2010 <- rep(0, 15)
+
+
+for (k in 1:15) {
+    # Perform clustering
+    kclust_2010 <- kmeans(scale(songs_2010s), centers = k)
+
+    # Store the total within-cluster sum of squares
+    tot_wc_ss_2010[k] <- kclust_2010$tot.withinss
+}
+```
+
+
+```{r}
+# png(filename="k_plot.png", width=1600, height=600)
+
+par(bg = "black", mfrow = c(1, 2))
+plot(1:15, tot_wc_ss_2000, type = "b", main = "2000s", xlab = "Number of clusters", ylab = "Total within-cluster sum of squares", col = "pink",           
+    col.main = "white",    
+    col.lab = "white",    
+    col.axis = "white",   
+    fg = "white")
+
+plot(1:15, tot_wc_ss_2010, type = "b", main = "2010s", xlab = "Number of clusters", ylab = "Total within-cluster sum of squares", col = "pink",           
+    col.main = "white",   
+    col.lab = "white",    
+    col.axis = "white",   
+    fg = "white") 
+```
+
+## K-Means Clustering
+
+```{r}
+set.seed(202)
+kclust_2000_scale <- kmeans(scale(songs_2000s), centers = 6)
+kclust_2000_scale
+
+kclust_2010_scale <- kmeans(scale(songs_2010s), centers = 6)
+kclust_2010_scale
+
+songs_2000s <- songs_2000s %>%
+    mutate(
+        kclust_2000_scale = factor(kclust_2000_scale$cluster)
+    )
+
+songs_2010s <- songs_2010s %>%
+    mutate(
+        kclust_2010_scale = factor(kclust_2010_scale$cluster)
+    )
+```
+## Cluster Visualization
+
+```{r, message = F}
+# loudness vs acousticness
+ggplot(songs_2000s, aes(y = acousticness, x = loudness, color = kclust_2000_scale)) +
+    geom_point() +
+    geom_smooth(se = FALSE) +
+    scale_color_brewer(palette = "Set3") +
+    labs(title = "2000s") +
+    theme_classic() +
+    theme(plot.background = element_rect(fill = "black", color = "black"), panel.background = element_rect(color = "black", fill = "black"), text = element_text(color = "white"), axis.text=element_text(color="white"), axis.line =element_line(color = "white"), legend.position = "none", plot.title = element_text(face = "bold", hjust = 0.5))
+
+
+ggplot(songs_2010s, aes(y = acousticness, x = loudness, color = kclust_2010_scale)) +
+    geom_point() +
+    geom_smooth(se = FALSE) +
+    scale_color_brewer(palette = "Set3") +
+    labs(title = "2010s") +
+    theme_classic() +
+    theme(plot.background = element_rect(fill = "black", color = "black"), panel.background = element_rect(color = "black", fill = "black"), text = element_text(color = "white"), axis.text=element_text(color="white"), axis.line =element_line(color = "white"), legend.position = "none", plot.title = element_text(face = "bold", hjust = 0.5))
+```
+
+```{r, message=F}
+# loudness vs valence
+ggplot(songs_2000s, aes(y = loudness, x = valence, color = kclust_2000_scale)) +
+    geom_point() +
+    geom_smooth(se = FALSE) +
+    scale_color_brewer(palette = "Set3") +
+    labs(title = "2000s") +
+    theme_classic() +
+    theme(plot.background = element_rect(fill = "black", color = "black"), panel.background = element_rect(color = "black", fill = "black"), text = element_text(color = "white"), axis.text=element_text(color="white"), axis.line =element_line(color = "white"), legend.position = "none", plot.title = element_text(face = "bold", hjust = 0.5))
+
+ggplot(songs_2010s, aes(y = loudness, x = valence, color = kclust_2010_scale)) +
+    geom_point() +
+    geom_smooth(se = FALSE) +
+    scale_color_brewer(palette = "Set3") +
+    labs(title = "2010s") +
+    theme_classic() +
+    theme(plot.background = element_rect(fill = "black", color = "black"), panel.background = element_rect(color = "black", fill = "black"), text = element_text(color = "white"), axis.text=element_text(color="white"), axis.line =element_line(color = "white"), legend.position = "none", plot.title = element_text(face = "bold", hjust = 0.5))
+```
+
+```{r, message = F}
+# valence vs acousticness
+ggplot(songs_2000s, aes(y = valence, x = acousticness, color = kclust_2000_scale)) +
+    geom_point() +
+    geom_smooth(se = FALSE) +
+    scale_color_brewer(palette = "Set3") +
+    labs(title = "2000s") +
+    theme_classic() +
+    theme(plot.background = element_rect(fill = "black", color = "black"), panel.background = element_rect(color = "black", fill = "black"), text = element_text(color = "white"), axis.text=element_text(color="white"), axis.line =element_line(color = "white"), legend.position = "none", plot.title = element_text(face = "bold", hjust = 0.5))
+
+ggplot(songs_2010s, aes(y = valence, x = acousticness, color = kclust_2010_scale)) +
+    geom_point() +
+    geom_smooth(se = FALSE) +
+    scale_color_brewer(palette = "Set3") +
+    labs(title = "2010s") +
+    theme_classic()+
+    theme(plot.background = element_rect(fill = "black", color = "black"), panel.background = element_rect(color = "black", fill = "black"), text = element_text(color = "white"), axis.text=element_text(color="white"), axis.line =element_line(color = "white"), legend.position = "none", plot.title = element_text(face = "bold", hjust = 0.5))
+```
+
+## Example from Popular Artists
+
+```{r, message=F}
+songs_artists <- songs %>%
+  filter(performer %in% c("Beyonce", "Coldplay","Taylor Swift")) %>%
+  select(year, song, performer, loudness, acousticness, valence)
+
+songs_artists %>%
+  ggplot(aes(x = year, y = loudness, color = performer)) +
+  geom_point(size = 2, alpha = 0.7) + 
+  geom_smooth(se = FALSE) +
+  geom_vline(xintercept = 2010, color = "white", linetype = "dashed") +
+  geom_hline(yintercept = -10, color = "white", linetype = "dotdash") +
+  scale_color_manual(values = c("pink", "#FDE725", "#1F968B")) +
+  theme_classic() +
+  theme(plot.background = element_rect(fill = "black", color = "black"), panel.background = element_rect(color = "black", fill = "black"), legend.background = element_rect(color = "black", fill = "black"), text = element_text(color = "white"), axis.text=element_text(color="white"), axis.line =element_line(color = "white"), plot.title = element_text(size = 14, face = "bold", hjust = 0.5))
+
+songs_artists %>%
+  ggplot(aes(x = year, y = acousticness, color = performer)) +
+  geom_point(size = 2, alpha = 0.7) + 
+  geom_vline(xintercept = 2010, color = "white", linetype = "dashed") +
+  geom_hline(yintercept = 0.5, color = "white", linetype = "dotdash") +
+  scale_color_manual(values = c("pink", "#FDE725", "#1F968B")) +
+  theme_classic() +
+  theme(plot.background = element_rect(fill = "black", color = "black"), panel.background = element_rect(color = "black", fill = "black"), legend.background = element_rect(color = "black", fill = "black"), text = element_text(color = "white"), axis.text=element_text(color="white"), axis.line =element_line(color = "white"), plot.title = element_text(size = 14, face = "bold", hjust = 0.5))
+
+songs_artists %>%
+  ggplot(aes(x = year, y = valence, color = performer)) +
+  geom_point(size = 2, alpha = 0.7) + 
+  geom_smooth(se = FALSE) +
+  geom_vline(xintercept = 2010, color = "white", linetype = "dashed") +
+  geom_hline(yintercept = 0.5, color = "white", linetype = "dotdash") +
+  scale_color_manual(values = c("pink", "#FDE725", "#1F968B")) +
+  theme_classic() +
+  theme(plot.background = element_rect(fill = "black", color = "black"), panel.background = element_rect(color = "black", fill = "black"), legend.background = element_rect(color = "black", fill = "black"), text = element_text(color = "white"), axis.text=element_text(color="white"), axis.line =element_line(color = "white"), plot.title = element_text(size = 14, face = "bold", hjust = 0.5))
+```
+
