@@ -1,5 +1,6 @@
 # The Association between Audio Features, Popularity, and Listeners’ Preferences
 ###### Author: Avianna Bui 
+###### Methods: Predictive Analytics with Random Forest, LASSO, and GAM; Cluster Analysis with K-Means Clustering; Correlation Analysis
 
 ## Introduction
 What aspect do hit songs share? With the increasing globalization of the US music industry and the rise of experimental music, it becomes more challenging to determine what features distinguish hits from less popular songs. As music continues to play an integral role in our lives, whether for recreational purposes or as a mechanism for emotional outlets, it is crucial to understand the musical mechanisms that affect their popularity. By examining the factors that influence the success of a song over time, we can gain a deeper insight into music preferences and listeners' behavior in the United States.
